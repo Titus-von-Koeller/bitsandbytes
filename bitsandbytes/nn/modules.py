@@ -142,7 +142,14 @@ class Embedding(torch.nn.Embedding):
 
 class Params4bit(torch.nn.Parameter):
 
-    def __new__(cls, data: Optional[torch.Tensor] = None, requires_grad=True, quant_state: QuantState = None, blocksize: int = 64, compress_statistics: bool = True, quant_type: str = 'fp4') -> "Params4bit":
+    def __new__(cls,
+                data: Optional[torch.Tensor] = None,
+                requires_grad=True,
+                quant_state: QuantState = None,
+                blocksize: int = 64,
+                compress_statistics: bool = True,
+                quant_type: str = 'fp4',
+                module=None) -> "Params4bit":
         if data is None:
             data = torch.empty(0)
 
@@ -152,6 +159,33 @@ class Params4bit(torch.nn.Parameter):
         self.quant_type = quant_type
         self.quant_state = quant_state
         self.data = data
+        self.module = module
+        return self
+
+    @classmethod
+    def from_prequantized(cls,
+                          data: torch.Tensor,
+                          quantized_stats: Dict[str, Any],
+                          requires_grad: bool = False,
+                          device='cuda',
+                          **kwargs) -> "Params4bit":
+        self = torch.Tensor._make_subclass(cls, data.to(device))
+        self.requires_grad = requires_grad
+        self.quant_state = QuantState.from_dict(qs_dict=quantized_stats,
+                                                device=device)
+        self.blocksize = self.quant_state.blocksize
+        self.compress_statistics = self.quant_state.nested
+        self.quant_type = self.quant_state.quant_type
+        return self
+
+    @classmethod
+    def from_prequantized(cls, data: torch.Tensor, quantized_stats: Dict[str, Any], requires_grad: bool = False, device='cuda', **kwargs) -> "Params4bit":
+        self = torch.Tensor._make_subclass(cls, data.to(device))
+        self.requires_grad = requires_grad
+        self.quant_state = QuantState.from_dict(qs_dict=quantized_stats, device=device)
+        self.blocksize = self.quant_state.blocksize
+        self.compress_statistics = self.quant_state.nested
+        self.quant_type = self.quant_state.quant_type
         return self
 
     @classmethod
@@ -166,14 +200,28 @@ class Params4bit(torch.nn.Parameter):
 
     def cuda(self, device):
         w = self.data.contiguous().half().cuda(device)
-        w_4bit, quant_state = bnb.functional.quantize_4bit(w, blocksize=self.blocksize, compress_statistics=self.compress_statistics, quant_type=self.quant_type)
+        w_4bit, quant_state = bnb.functional.quantize_4bit(
+            w,
+            blocksize=self.blocksize,
+            compress_statistics=self.compress_statistics,
+            quant_type=self.quant_type)
         self.data = w_4bit
         self.quant_state = quant_state
+
+        # backup quant_state in parent module, as it sometimes gets lost in conversions,
+        # e.g. when using fsdp, and we need to then recover it in the module
+        if self.module is not None:
+            self.module.quant_state = quant_state
 
         return self
 
     @overload
-    def to(self: T, device: Optional[Union[int, device]] = ..., dtype: Optional[Union[dtype, str]] = ..., non_blocking: bool = ...,) -> T:
+    def to(
+        self: T,
+        device: Optional[Union[int, device]] = ...,
+        dtype: Optional[Union[dtype, str]] = ...,
+        non_blocking: bool = ...,
+    ) -> T:
         ...
 
     @overload
@@ -185,30 +233,48 @@ class Params4bit(torch.nn.Parameter):
         ...
 
     def to(self, *args, **kwargs):
-        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
+        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(
+            *args, **kwargs)
 
-        if (device is not None and device.type == "cuda" and self.data.device.type == "cpu"):
+        if (device is not None and device.type == "cuda"
+                and self.data.device.type == "cpu"):
             return self.cuda(device)
         else:
             if self.quant_state is not None:
                 self.quant_state.to(device)
 
-            new_param = Params4bit(super().to(device=device, dtype=dtype, non_blocking=non_blocking),
-                                   requires_grad=self.requires_grad, quant_state=self.quant_state,
-                                   blocksize=self.blocksize, compress_statistics=self.compress_statistics,
-                                   quant_type=self.quant_type)
+            new_param = Params4bit(
+                super().to(device=device,dtype=dtype, non_blocking=non_blocking),
+                requires_grad=self.requires_grad, quant_state=self.quant_state,
+                blocksize=self.blocksize,
+                compress_statistics=self.compress_statistics,
+                quant_type=self.quant_type)
 
             return new_param
 
 
 class Linear4bit(nn.Linear):
 
-    def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True, quant_type='fp4', device=None):
+    def __init__(
+            self,
+            input_features,
+            output_features,
+            bias=True,
+            compute_dtype=None,
+            compress_statistics=True,
+            quant_type='nf4',
+            device=None):
         super().__init__(input_features, output_features, bias, device)
-        self.weight = Params4bit(self.weight.data, requires_grad=False, compress_statistics=compress_statistics, quant_type=quant_type)
-        # self.persistent_buffers = []  # TODO consider as way to save quant state
+        self.weight = Params4bit(
+            self.weight.data,
+            requires_grad=False,
+            compress_statistics=compress_statistics,
+            quant_type=quant_type,
+            module=self)
         self.compute_dtype = compute_dtype
         self.compute_type_is_set = False
+        self.is_fsdp = False
+        self.quant_state = None
 
     def set_compute_type(self, x):
         if x.dtype in [torch.float32, torch.bfloat16]:
@@ -242,8 +308,18 @@ class Linear4bit(nn.Linear):
         if self.bias is not None and self.bias.dtype != x.dtype:
             self.bias.data = self.bias.data.to(x.dtype)
 
+
         if getattr(self.weight, 'quant_state', None) is None:
-            print('FP4 quantization state not initialized. Please call .cuda() or .to(device) on the LinearFP4 layer first.')
+            if  getattr(self, 'quant_state', None) is not None:
+                # the quant state got lost when the parameter got converted. This happens for example for fsdp
+                # since we registered the module, we can recover the state here
+                assert self.weight.shape[1] == 1
+                if not isinstance(self.weight, Params4bit):
+                    self.weight = Params4bit(self.weight)
+                self.weight.quant_state = self.quant_state
+            else:
+                print('FP4 quantization state not initialized. Please call .cuda() or .to(device) on the LinearFP4 layer first.')
+
         if not self.compute_type_is_set:
             self.set_compute_type(x)
             self.compute_type_is_set = True
